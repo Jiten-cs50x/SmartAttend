@@ -11,6 +11,12 @@ import {
   getStudentAttendanceHistoryDetail,
 } from "../controllers/studentController.js";
 
+import {
+  getStudentNotifications,
+  markStudentNotificationAsRead,
+  markAllStudentNotificationsAsRead,
+} from "../controllers/notificationController.js";
+
 import { authenticate } from "../middleware/authMiddleware.js";
 
 import { authorize } from "../middleware/roleMiddleware.js";
@@ -61,6 +67,27 @@ router.get(
   authenticate,
   authorize("STUDENT"),
   getStudentAttendanceHistoryDetail,
+);
+
+router.get(
+  "/notifications",
+  authenticate,
+  authorize("STUDENT"),
+  getStudentNotifications,
+);
+
+router.put(
+  "/notifications/read-all",
+  authenticate,
+  authorize("STUDENT"),
+  markAllStudentNotificationsAsRead,
+);
+
+router.put(
+  "/notifications/:id/read",
+  authenticate,
+  authorize("STUDENT"),
+  markStudentNotificationAsRead,
 );
 
 export default router;
