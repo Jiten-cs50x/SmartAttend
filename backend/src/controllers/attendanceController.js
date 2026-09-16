@@ -1,4 +1,4 @@
-// import { db } from "../prisma/db.js";
+import { db } from "../prisma/db.js";
 
 // // ---------------------------------------------------------
 // // GET ALL ATTENDANCE
@@ -1580,7 +1580,7 @@ export const createAttendanceSession = async (req, res) => {
       timetables.filter((item) => Number(item.classId) === Number(classId)),
     );
 
-    const todayTimetable = timetables.find(
+    const timetable = timetables.find(
       (item) =>
         Number(item.classId) === Number(classId) &&
         Number(item.dayOfWeek) === todayDay,
