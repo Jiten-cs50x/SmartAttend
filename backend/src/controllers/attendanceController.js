@@ -1,4 +1,4 @@
-import { db } from "../prisma/db.js";
+// import { db } from "../prisma/db.js";
 
 // // ---------------------------------------------------------
 // // GET ALL ATTENDANCE
