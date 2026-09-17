@@ -15,10 +15,54 @@ export const getAdminDashboard = async (req, res) => {
     const sessions = await db.orm.public.AttendanceSession.all();
     const attendance = await db.orm.public.Attendance.all();
 
+    // SUPER_ADMIN can see everything.
+    // ADMIN/HOD can see only their department.
+    let visibleStudents = students;
+    let visibleFaculty = faculty;
+    let visibleClasses = classes;
+    let visibleSessions = sessions;
+
+    if (req.user.role === "ADMIN" || req.user.role === "HOD") {
+      if (!req.user.departmentId) {
+        return res.status(403).json({
+          success: false,
+          message: "Admin account is not assigned to a department",
+        });
+      }
+
+      const departmentId = Number(req.user.departmentId);
+
+      // Department-scoped students
+      visibleStudents = students.filter(
+        (student) => Number(student.departmentId) === departmentId,
+      );
+
+      // Department-scoped faculty
+      // Faculty management itself can remain cross-department later,
+      // but dashboard faculty count represents faculty belonging to this department.
+      visibleFaculty = faculty.filter(
+        (member) => Number(member.departmentId) === departmentId,
+      );
+
+      // Department-scoped classes
+      visibleClasses = classes.filter(
+        (classItem) => Number(classItem.departmentId) === departmentId,
+      );
+
+      // Sessions belong to classes, so first find this department's class IDs.
+      const departmentClassIds = new Set(
+        visibleClasses.map((classItem) => Number(classItem.id)),
+      );
+
+      visibleSessions = sessions.filter((session) =>
+        departmentClassIds.has(Number(session.classId)),
+      );
+    }
+
     // Get today's date in YYYY-MM-DD format
     const today = new Date().toISOString().split("T")[0];
 
-    const todaySessions = sessions.filter((session) =>
+    const todaySessions = visibleSessions.filter((session) =>
       String(session.sessionDate).startsWith(today),
     );
 
@@ -26,9 +70,24 @@ export const getAdminDashboard = async (req, res) => {
       (session) => session.endedAt === null,
     );
 
-    const todayAttendance = attendance.filter((record) =>
-      String(record.markedAt).startsWith(today),
+    // Attendance records belonging to today's sessions
+    const todaySessionIds = new Set(
+      todaySessions.map((session) => Number(session.id)),
     );
+
+    const todayAttendance = attendance.filter((record) => {
+      if (!String(record.markedAt).startsWith(today)) {
+        return false;
+      }
+
+      // If attendance has a sessionId, use it for department filtering.
+      if (record.sessionId !== undefined && record.sessionId !== null) {
+        return todaySessionIds.has(Number(record.sessionId));
+      }
+
+      // Keep compatibility with existing attendance records.
+      return req.user.role === "SUPER_ADMIN";
+    });
 
     const presentToday = todayAttendance.filter(
       (record) => record.status === "PRESENT",
@@ -41,9 +100,9 @@ export const getAdminDashboard = async (req, res) => {
     return res.status(200).json({
       success: true,
       data: {
-        totalStudents: students.length,
-        totalFaculty: faculty.length,
-        totalClasses: classes.length,
+        totalStudents: visibleStudents.length,
+        totalFaculty: visibleFaculty.length,
+        totalClasses: visibleClasses.length,
         activeSessions: activeSessions.length,
         todaySessions: todaySessions.length,
         todayAttendance: todayAttendance.length,
@@ -60,6 +119,7 @@ export const getAdminDashboard = async (req, res) => {
     });
   }
 };
+
 
 // Helper to resolve department from numeric ID or string code/name
 export const resolveDepartment = (departments, identifier) => {
@@ -79,6 +139,123 @@ export const resolveDepartment = (departments, identifier) => {
     ) || null
   );
 };
+
+// Helper for validating USN range specification
+export function parseAndValidateUsnRange(from, to) {
+  const sFrom = String(from || "").trim().toUpperCase();
+  const sTo = String(to || "").trim().toUpperCase();
+
+  if (!sFrom || !sTo) {
+    return { valid: false, error: "Both Beginning USN and Ending USN are required" };
+  }
+
+  // Case 1: Purely numeric (e.g. 1 to 23)
+  const isFromNum = /^\d+$/.test(sFrom);
+  const isToNum = /^\d+$/.test(sTo);
+
+  if (isFromNum && isToNum) {
+    const fromVal = parseInt(sFrom, 10);
+    const toVal = parseInt(sTo, 10);
+    if (fromVal > toVal) {
+      return { valid: false, error: `Beginning USN (${sFrom}) cannot be greater than Ending USN (${sTo})` };
+    }
+    return { valid: true, isNumericOnly: true, fromVal, toVal, sFrom, sTo };
+  }
+
+  // Case 2: Alphanumeric prefix + numeric suffix (e.g. 2VD23CS001 to 2VD23CS023)
+  const fromMatch = sFrom.match(/^(.*?)(\d+)$/);
+  const toMatch = sTo.match(/^(.*?)(\d+)$/);
+
+  if (fromMatch && toMatch) {
+    const fromPrefix = fromMatch[1];
+    const fromNum = parseInt(fromMatch[2], 10);
+    const toPrefix = toMatch[1];
+    const toNum = parseInt(toMatch[2], 10);
+
+    if (fromPrefix !== toPrefix) {
+      return {
+        valid: false,
+        error: `Beginning USN prefix ("${fromPrefix}") and Ending USN prefix ("${toPrefix}") do not match`,
+      };
+    }
+
+    if (fromNum > toNum) {
+      return {
+        valid: false,
+        error: `Beginning USN (${sFrom}) cannot be greater than Ending USN (${sTo})`,
+      };
+    }
+
+    return {
+      valid: true,
+      prefix: fromPrefix,
+      fromNum,
+      toNum,
+      sFrom,
+      sTo,
+    };
+  }
+
+  // Case 3: Lexicographical comparison
+  if (sFrom > sTo) {
+    return {
+      valid: false,
+      error: `Beginning USN (${sFrom}) cannot be greater than Ending USN (${sTo})`,
+    };
+  }
+
+  return { valid: true, isLexical: true, sFrom, sTo };
+}
+
+// Helper for USN range matching
+export function checkUsnRange(usn, from, to) {
+  if (!from && !to) return true;
+  const sUsn = String(usn || "").trim().toUpperCase();
+  const rangeSpec = parseAndValidateUsnRange(from, to);
+  if (!rangeSpec.valid) return false;
+
+  if (rangeSpec.prefix !== undefined) {
+    const match = sUsn.match(/^(.*?)(\d+)$/);
+    if (!match) return false;
+    const prefix = match[1];
+    const num = parseInt(match[2], 10);
+    return prefix === rangeSpec.prefix && num >= rangeSpec.fromNum && num <= rangeSpec.toNum;
+  }
+
+  if (rangeSpec.isNumericOnly) {
+    const match = sUsn.match(/(\d+)$/);
+    if (!match) return false;
+    const num = parseInt(match[1], 10);
+    return num >= rangeSpec.fromVal && num <= rangeSpec.toVal;
+  }
+
+  return sUsn >= rangeSpec.sFrom && sUsn <= rangeSpec.sTo;
+}
+
+// Helper for numeric-aware USN sorting (LOW -> HIGH)
+export function compareUsn(a, b) {
+  const sA = String(a || "").trim().toUpperCase();
+  const sB = String(b || "").trim().toUpperCase();
+  if (!sA && !sB) return 0;
+  if (!sA) return 1;
+  if (!sB) return -1;
+
+  const matchA = sA.match(/^(.*?)(\d+)$/);
+  const matchB = sB.match(/^(.*?)(\d+)$/);
+
+  if (matchA && matchB) {
+    const prefixA = matchA[1];
+    const prefixB = matchB[1];
+    if (prefixA === prefixB) {
+      const numA = parseInt(matchA[2], 10);
+      const numB = parseInt(matchB[2], 10);
+      if (numA !== numB) return numA - numB;
+    }
+  }
+
+  return sA.localeCompare(sB, undefined, { numeric: true, sensitivity: "base" });
+}
+
 
 const FACULTY_DEPARTMENT_NAMES = {
   CSE: "Computer Science and Engineering",
@@ -202,124 +379,10 @@ const FALLBACK_STUDENTS = [
   { id: 702, name: "Karthik Hegde", usn: "01DS002", department: "Computer Science (Data Science)", departmentCode: "CSE-DS", semester: 3, section: "A", Lab: "A1", lab: "A1", academicYear: "2026-27", email: "karthik.hegde@klsvdit.edu.in", deviceBound: false, boundDeviceName: null },
 ];
 
-// Helper for validating USN range specification
-export function parseAndValidateUsnRange(from, to) {
-  const sFrom = String(from || "").trim().toUpperCase();
-  const sTo = String(to || "").trim().toUpperCase();
-
-  if (!sFrom || !sTo) {
-    return { valid: false, error: "Both Beginning USN and Ending USN are required" };
-  }
-
-  // Case 1: Purely numeric (e.g. 1 to 23)
-  const isFromNum = /^\d+$/.test(sFrom);
-  const isToNum = /^\d+$/.test(sTo);
-
-  if (isFromNum && isToNum) {
-    const fromVal = parseInt(sFrom, 10);
-    const toVal = parseInt(sTo, 10);
-    if (fromVal > toVal) {
-      return { valid: false, error: `Beginning USN (${sFrom}) cannot be greater than Ending USN (${sTo})` };
-    }
-    return { valid: true, isNumericOnly: true, fromVal, toVal, sFrom, sTo };
-  }
-
-  // Case 2: Alphanumeric prefix + numeric suffix (e.g. 2VD23CS001 to 2VD23CS023)
-  const fromMatch = sFrom.match(/^(.*?)(\d+)$/);
-  const toMatch = sTo.match(/^(.*?)(\d+)$/);
-
-  if (fromMatch && toMatch) {
-    const fromPrefix = fromMatch[1];
-    const fromNum = parseInt(fromMatch[2], 10);
-    const toPrefix = toMatch[1];
-    const toNum = parseInt(toMatch[2], 10);
-
-    if (fromPrefix !== toPrefix) {
-      return {
-        valid: false,
-        error: `Beginning USN prefix ("${fromPrefix}") and Ending USN prefix ("${toPrefix}") do not match`,
-      };
-    }
-
-    if (fromNum > toNum) {
-      return {
-        valid: false,
-        error: `Beginning USN (${sFrom}) cannot be greater than Ending USN (${sTo})`,
-      };
-    }
-
-    return {
-      valid: true,
-      prefix: fromPrefix,
-      fromNum,
-      toNum,
-      sFrom,
-      sTo,
-    };
-  }
-
-  // Case 3: Lexicographical comparison
-  if (sFrom > sTo) {
-    return {
-      valid: false,
-      error: `Beginning USN (${sFrom}) cannot be greater than Ending USN (${sTo})`,
-    };
-  }
-
-  return { valid: true, isLexical: true, sFrom, sTo };
-}
-
-// Helper for USN range matching
-export function checkUsnRange(usn, from, to) {
-  if (!from && !to) return true;
-  const sUsn = String(usn || "").trim().toUpperCase();
-  const rangeSpec = parseAndValidateUsnRange(from, to);
-  if (!rangeSpec.valid) return false;
-
-  if (rangeSpec.prefix !== undefined) {
-    const match = sUsn.match(/^(.*?)(\d+)$/);
-    if (!match) return false;
-    const prefix = match[1];
-    const num = parseInt(match[2], 10);
-    return prefix === rangeSpec.prefix && num >= rangeSpec.fromNum && num <= rangeSpec.toNum;
-  }
-
-  if (rangeSpec.isNumericOnly) {
-    const match = sUsn.match(/(\d+)$/);
-    if (!match) return false;
-    const num = parseInt(match[1], 10);
-    return num >= rangeSpec.fromVal && num <= rangeSpec.toVal;
-  }
-
-  return sUsn >= rangeSpec.sFrom && sUsn <= rangeSpec.sTo;
-}
-
-// Helper for numeric-aware USN sorting (LOW -> HIGH)
-export function compareUsn(a, b) {
-  const sA = String(a || "").trim().toUpperCase();
-  const sB = String(b || "").trim().toUpperCase();
-  if (!sA && !sB) return 0;
-  if (!sA) return 1;
-  if (!sB) return -1;
-
-  const matchA = sA.match(/^(.*?)(\d+)$/);
-  const matchB = sB.match(/^(.*?)(\d+)$/);
-
-  if (matchA && matchB) {
-    const prefixA = matchA[1];
-    const prefixB = matchB[1];
-    if (prefixA === prefixB) {
-      const numA = parseInt(matchA[2], 10);
-      const numB = parseInt(matchB[2], 10);
-      if (numA !== numB) return numA - numB;
-    }
-  }
-
-  return sA.localeCompare(sB, undefined, { numeric: true, sensitivity: "base" });
-}
+// H
 
 export const getAdminStudents = async (req, res) => {
-  try {
+ try {
     // HOD dept resolved from JWT claim (DB-authoritative, set by authMiddleware)
     // null = SUPER_ADMIN/institution-wide; number = HOD locked to that departmentId
     const hodDepartmentId = req.user?.departmentId ?? null;
@@ -436,6 +499,161 @@ export const getAdminStudents = async (req, res) => {
   }
 };
 
+// Automatically determine the lab batch from the student's USN.
+// Every 20 students form one batch:
+// 001-020 -> 1
+// 021-040 -> 2
+// 041-060 -> 3
+// 061-080 -> 4
+const getAutomaticLabBatch = (usn, section) => {
+  const normalizedUsn = String(usn || "")
+    .trim()
+    .toUpperCase();
+  const normalizedSection = String(section || "A")
+    .trim()
+    .toUpperCase();
+
+  // Extract the numeric suffix from the USN.
+  const match = normalizedUsn.match(/(\d+)$/);
+
+  if (!match) {
+    return null;
+  }
+
+  const usnNumber = parseInt(match[1], 10);
+
+  if (!Number.isFinite(usnNumber) || usnNumber <= 0) {
+    return null;
+  }
+
+  // 001-020 = 1, 021-040 = 2, etc.
+  const batchNumber = Math.ceil(usnNumber / 20);
+
+  // Current Admin system supports maximum 4 batches per division.
+  if (batchNumber < 1 || batchNumber > 4) {
+    return null;
+  }
+
+  return `${normalizedSection}${batchNumber}`;
+};
+
+const syncStudentLabBatch = async (student) => {
+  try {
+    if (!student?.id || !student?.Lab) {
+      return null;
+    }
+
+    const labBatchName = String(student.Lab).trim().toUpperCase();
+
+    // Find an existing LabBatch for this student's
+    // department, semester, section and academic year.
+    let labBatch = await db.orm.public.LabBatch.where({
+      name: labBatchName,
+      departmentId: student.departmentId,
+      semester: student.semester,
+      section: student.section,
+      academicYear: student.academicYear,
+    }).all();
+
+    labBatch = labBatch[0] || null;
+
+    // Create the LabBatch automatically if it doesn't exist.
+    if (!labBatch) {
+      labBatch = await db.orm.public.LabBatch.create({
+        name: labBatchName,
+        departmentId: student.departmentId,
+        semester: student.semester,
+        section: student.section,
+        academicYear: student.academicYear,
+      });
+
+      console.log(
+        `Created LabBatch ${labBatchName} for ${student.section}, semester ${student.semester}`,
+      );
+    }
+
+    // Prevent duplicate StudentBatch records.
+    const existingAssignments = await db.orm.public.StudentBatch.where({
+      studentId: student.id,
+      batchId: labBatch.id,
+    }).all();
+
+    if (!existingAssignments.length) {
+      await db.orm.public.StudentBatch.create({
+        studentId: student.id,
+        batchId: labBatch.id,
+      });
+
+      console.log(
+        `Student ${student.registerNumber} assigned to LabBatch ${labBatchName}`,
+      );
+    }
+
+    return labBatch;
+  } catch (error) {
+    console.error(
+      `Student lab batch sync failed for ${student?.registerNumber}:`,
+      error,
+    );
+
+    throw error;
+  }
+};
+
+const syncStudentEnrollments = async (student) => {
+  try {
+    const classes = await db.orm.public.Class.where({
+      departmentId: student.departmentId,
+      semester: student.semester,
+      section: student.section,
+      academicYear: student.academicYear,
+    }).all();
+
+    if (!classes.length) {
+      console.log(
+        `No matching classes found for student ${student.registerNumber}`,
+      );
+      return 0;
+    }
+
+    const existingEnrollments = await db.orm.public.Enrollment.where({
+      studentId: student.id,
+    }).all();
+
+    let createdCount = 0;
+
+    for (const classItem of classes) {
+      const alreadyEnrolled = existingEnrollments.some(
+        (enrollment) => Number(enrollment.classId) === Number(classItem.id),
+      );
+
+      if (alreadyEnrolled) {
+        continue;
+      }
+
+      await db.orm.public.Enrollment.create({
+        studentId: student.id,
+        classId: classItem.id,
+      });
+
+      createdCount++;
+    }
+
+    console.log(
+      `Enrollment sync: ${student.registerNumber} -> ${createdCount} class(es)`,
+    );
+
+    return createdCount;
+  } catch (error) {
+    console.error(
+      `Enrollment sync failed for student ${student.registerNumber}:`,
+      error,
+    );
+
+    throw error;
+  }
+};
+
 export const createAdminStudent = async (req, res) => {
   try {
     const {
@@ -458,10 +676,10 @@ export const createAdminStudent = async (req, res) => {
     }
 
     // Find department
+    // Find department
     const departments = await db.orm.public.Department.all();
 
     let selectedDepartment = null;
-
     // HOD dept resolved from JWT claim (DB-authoritative, set by authMiddleware)
     // null = SUPER_ADMIN/institution-wide; number = HOD locked to that departmentId
     const hodDepartmentId = req.user?.departmentId ?? null;
@@ -614,16 +832,6 @@ export const createAdminStudent = async (req, res) => {
   }
 };
 
-/**
- * Bulk imports students from Excel, CSV, or PDF file
- * 
- * Features:
- * - Automatically derives department from authenticated HOD JWT
- * - Applies single Year of Study to all extracted students
- * - Supports ?preview=true for pre-import validation without database modification
- * - Prevents intra-file duplicate USNs and database duplicate USNs
- * - Batches valid inserts with automatic User + Student creation
- */
 export const importAdminStudents = async (req, res) => {
   try {
     const callerRole = req.user?.role;
@@ -1468,859 +1676,593 @@ export const updateAdminStudent = async (req, res) => {
   }
 };
 
-/**
- * GET /api/admin/students/:id/device
- * Retrieves device binding details for a student.
- * HOD department isolation strictly enforced.
- */
-export const getAdminStudentDevice = async (req, res) => {
+
+export const getAdminStudentProfile = async (req, res) => {
   try {
-    const studentId = parseInt(req.params.id, 10);
-    if (isNaN(studentId)) {
-      return res.status(400).json({ success: false, message: "Invalid student ID" });
-    }
+    const studentId = Number(req.params.id);
 
-    // HOD dept resolved from JWT claim (DB-authoritative, set by authMiddleware)
-    // null = SUPER_ADMIN/institution-wide; number = HOD locked to that departmentId
-    const hodDepartmentId = req.user?.departmentId ?? null;
-
-    const students = await db.orm.public.Student.where({ id: studentId }).all();
-    if (!students || students.length === 0) {
-      return res.status(404).json({ success: false, message: "Student not found" });
-    }
-    const student = students[0];
-
-    const departments = await db.orm.public.Department.all();
-    const studentDept = departments.find((d) => d.id === student.departmentId);
-
-    if (hodDepartmentId && (!studentDept || !isDepartmentMatch(studentDept, hodDepartmentId))) {
-      return res.status(403).json({
+    if (!studentId || Number.isNaN(studentId)) {
+      return res.status(400).json({
         success: false,
-        message: "Forbidden: You cannot access device information for students outside your department.",
+        message: "Invalid student ID",
       });
     }
 
-    const devices = await db.orm.public.StudentDevice.where({ studentId: student.id }).all();
-    const users = await db.orm.public.User.where({ id: student.userId }).all();
-    const user = users[0];
+    const students = await db.orm.public.Student.all();
+    const users = await db.orm.public.User.all();
+    const departments = await db.orm.public.Department.all();
+    const devices = await db.orm.public.StudentDevice.all();
+    const attendance = await db.orm.public.Attendance.all();
+
+    const student = students.find((item) => item.id === studentId);
+
+    if (!student) {
+      return res.status(404).json({
+        success: false,
+        message: "Student not found",
+      });
+    }
+
+    // Department-level access control
+    if (
+      (req.user.role === "ADMIN" || req.user.role === "HOD") &&
+      Number(student.departmentId) !== Number(req.user.departmentId)
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "You can only access students in your department",
+      });
+    }
+
+    const user = users.find((item) => item.id === student.userId);
+
+    const department = departments.find(
+      (item) => item.id === student.departmentId,
+    );
+
+    const studentDevices = devices.filter(
+      (device) => device.studentId === student.id,
+    );
+
+    const activeDevices = studentDevices.filter(
+      (device) => device.isActive === true,
+    );
+
+    const studentAttendance = attendance.filter(
+      (record) => record.studentId === student.id,
+    );
+
+    const totalAttendance = studentAttendance.length;
+
+    const presentAttendance = studentAttendance.filter(
+      (record) => record.status === "PRESENT",
+    ).length;
+
+    const attendancePercentage =
+      totalAttendance > 0
+        ? Number(((presentAttendance / totalAttendance) * 100).toFixed(1))
+        : 0;
+
+    const activeDevice = activeDevices[0] ?? null;
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        id: student.id,
+        userId: student.userId,
+
+        name: user?.name ?? "Unknown",
+        email: user?.email ?? null,
+
+        usn: student.registerNumber,
+
+        department: department?.name ?? "Unknown",
+        departmentId: student.departmentId,
+
+        semester: student.semester,
+        section: student.section,
+        academicYear: student.academicYear,
+
+        attendancePercentage,
+
+        deviceBound: activeDevices.length > 0,
+        deviceCount: studentDevices.length,
+        activeDeviceCount: activeDevices.length,
+
+        device: activeDevice
+          ? {
+              id: activeDevice.id,
+              publicKey: activeDevice.publicKey,
+              isActive: activeDevice.isActive,
+            }
+          : null,
+      },
+    });
+  } catch (error) {
+    console.error("Admin student profile error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load student profile",
+    });
+  }
+};
+
+export const unbindAdminStudentDevice = async (req, res) => {
+  try {
+    const studentId = Number(req.params.id);
+
+    if (!studentId || Number.isNaN(studentId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid student ID",
+      });
+    }
+
+    const students = await db.orm.public.Student.all();
+
+    const student = students.find((item) => item.id === studentId);
+
+    if (!student) {
+      return res.status(404).json({
+        success: false,
+        message: "Student not found",
+      });
+    }
+
+    // Department-level access control
+    if (
+      (req.user.role === "ADMIN" || req.user.role === "HOD") &&
+      Number(student.departmentId) !== Number(req.user.departmentId)
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "You can only manage students in your department",
+      });
+    }
+
+    const devices = await db.orm.public.StudentDevice.where({
+      studentId: student.id,
+    }).all();
+
+    const activeDevices = devices.filter((device) => device.isActive === true);
+
+    if (activeDevices.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No active device is currently bound to this student",
+      });
+    }
+
+    let unboundCount = 0;
+
+    for (const device of activeDevices) {
+      await db.orm.public.StudentDevice.where({
+        id: device.id,
+      }).update({
+        isActive: false,
+      });
+
+      unboundCount++;
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Student device binding reset successfully",
+      data: {
+        studentId: student.id,
+        unboundCount,
+        deviceBound: false,
+      },
+    });
+  } catch (error) {
+    console.error("Admin student device unbind error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to unbind student device",
+    });
+  }
+};
+
+export const getAdminStudentDevice = async (req, res) => {
+  try {
+    const studentId = Number(req.params.id);
+
+    if (!studentId || Number.isNaN(studentId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid student ID",
+      });
+    }
+
+    const students = await db.orm.public.Student.all();
+    const student = students.find((item) => item.id === studentId);
+
+    if (!student) {
+      return res.status(404).json({
+        success: false,
+        message: "Student not found",
+      });
+    }
+
+    // Department-level access control
+    if (
+      (req.user.role === "ADMIN" || req.user.role === "HOD") &&
+      Number(student.departmentId) !== Number(req.user.departmentId)
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "You can only manage students in your department",
+      });
+    }
+
+    const devices = await db.orm.public.StudentDevice.where({
+      studentId: student.id,
+    }).all();
+
+    const deviceDetails = devices.map((device) => ({
+      id: device.id,
+      publicKeyFingerprint: device.publicKey
+        ? `${device.publicKey.slice(0, 8)}...${device.publicKey.slice(-8)}`
+        : "",
+      isActive: device.isActive,
+      createdAt: device.createdAt,
+      updatedAt: device.createdAt,
+    }));
 
     return res.status(200).json({
       success: true,
       data: {
         studentId: student.id,
-        usn: student.registerNumber,
-        studentName: user?.name || "Student",
-        department: studentDept?.code || "Unknown",
-        devices: devices.map((d) => ({
-          id: d.id,
-          publicKeyFingerprint: d.publicKey && d.publicKey.length > 16 
-            ? `${d.publicKey.substring(0, 8)}...${d.publicKey.substring(d.publicKey.length - 8)}`
-            : d.publicKey,
-          isActive: d.isActive,
-          createdAt: d.createdAt,
-          updatedAt: d.updatedAt,
-        })),
-        isBound: devices.some((d) => d.isActive === true),
+        usn: student.usn,
+        studentName: student.name,
+        department: student.departmentId,
+        isBound: devices.some((device) => device.isActive === true),
+        devices: deviceDetails,
       },
     });
   } catch (error) {
-    console.error("Get admin student device error:", error);
+    console.error("Admin student device details error:", error);
+
     return res.status(500).json({
       success: false,
-      message: "Failed to retrieve student device information",
+      message: "Failed to load student device details",
     });
   }
 };
 
-/**
- * POST /api/admin/students/:id/device/reset
- * Resets/Unbinds a student's mobile device binding.
- * Used when a student changes or loses their mobile phone.
- * HOD department isolation strictly enforced.
- */
-export const resetAdminStudentDevice = async (req, res) => {
-  try {
-    const studentId = parseInt(req.params.id, 10);
-    if (isNaN(studentId)) {
-      return res.status(400).json({ success: false, message: "Invalid student ID" });
-    }
-
-    // HOD dept resolved from JWT claim (DB-authoritative, set by authMiddleware)
-    // null = SUPER_ADMIN/institution-wide; number = HOD locked to that departmentId
-    const hodDepartmentId = req.user?.departmentId ?? null;
-
-    const students = await db.orm.public.Student.where({ id: studentId }).all();
-    if (!students || students.length === 0) {
-      return res.status(404).json({ success: false, message: "Student not found" });
-    }
-    const student = students[0];
-
-    const departments = await db.orm.public.Department.all();
-    const studentDept = departments.find((d) => d.id === student.departmentId);
-
-    if (hodDepartmentId && (!studentDept || !isDepartmentMatch(studentDept, hodDepartmentId))) {
-      return res.status(403).json({
-        success: false,
-        message: "Forbidden: You cannot reset device binding for students outside your department.",
-      });
-    }
-
-    // Deactivate/reset existing device binding
-    await db.orm.public.StudentDevice.where({ studentId: student.id }).update({ isActive: false });
-
-    return res.status(200).json({
-      success: true,
-      message: "Student device binding has been reset successfully. The student can now register their new device.",
-    });
-  } catch (error) {
-    console.error("Reset admin student device error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Failed to reset student device binding",
-    });
-  }
-};
-
-/**
- * DELETE /api/admin/students/:id
- * Safely deletes a student.
- * Guard: If attendance records exist, deletion is rejected to protect academic audit history.
- * Cascades: Removes StudentDevice and Enrollment records, Student record, and linked User record.
- * HOD department isolation strictly enforced.
- */
-export const deleteAdminStudent = async (req, res) => {
-  try {
-    const studentId = parseInt(req.params.id, 10);
-    if (isNaN(studentId)) {
-      return res.status(400).json({ success: false, message: "Invalid student ID" });
-    }
-
-    // HOD dept resolved from JWT claim (DB-authoritative, set by authMiddleware)
-    // null = SUPER_ADMIN/institution-wide; number = HOD locked to that departmentId
-    const hodDepartmentId = req.user?.departmentId ?? null;
-
-    const students = await db.orm.public.Student.where({ id: studentId }).all();
-    if (!students || students.length === 0) {
-      return res.status(404).json({ success: false, message: "Student not found" });
-    }
-    const student = students[0];
-
-    const departments = await db.orm.public.Department.all();
-    const studentDept = departments.find((d) => d.id === student.departmentId);
-
-    if (hodDepartmentId && (!studentDept || !isDepartmentMatch(studentDept, hodDepartmentId))) {
-      return res.status(403).json({
-        success: false,
-        message: "Forbidden: You cannot delete students outside your department.",
-      });
-    }
-
-    // 1. Guard against deleting student with existing attendance history
-    const attendanceRecords = await db.orm.public.Attendance.where({ studentId: student.id }).all();
-    if (attendanceRecords && attendanceRecords.length > 0) {
-      return res.status(400).json({
-        success: false,
-        message: `Cannot delete student with ${attendanceRecords.length} existing attendance record(s). Academic attendance records must be preserved.`,
-      });
-    }
-
-    // 2. Safe deletion of related records
-    // Remove Enrollments
-    const enrollments = await db.orm.public.Enrollment.where({ studentId: student.id }).all();
-    if (enrollments && enrollments.length > 0) {
-      await db.orm.public.Enrollment.where({ studentId: student.id }).delete();
-    }
-
-    // Remove Student Devices
-    const devices = await db.orm.public.StudentDevice.where({ studentId: student.id }).all();
-    if (devices && devices.length > 0) {
-      await db.orm.public.StudentDevice.where({ studentId: student.id }).delete();
-    }
-
-    // Remove Student record
-    await db.orm.public.Student.where({ id: student.id }).delete();
-
-    // Remove associated User record if present
-    if (student.userId) {
-      const notifs = await db.orm.public.Notification.where({ userId: student.userId }).all();
-      if (notifs && notifs.length > 0) {
-        await db.orm.public.Notification.where({ userId: student.userId }).delete();
-      }
-      await db.orm.public.User.where({ id: student.userId }).delete();
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: "Student deleted successfully.",
-      data: {
-        id: student.id,
-        usn: student.registerNumber,
-      },
-    });
-  } catch (error) {
-    console.error("Delete admin student error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Failed to delete student",
-    });
-  }
-};
-
-export const VALID_FACULTY_DESIGNATIONS = [
-  "HOD",
-  "PROFESSOR",
-  "ASSOCIATE_PROFESSOR",
-  "ASSISTANT_PROFESSOR",
-];
-
-export function normalizeFacultyDesignation(value) {
-  if (!value) return "ASSISTANT_PROFESSOR";
-  const str = String(value).trim().toUpperCase().replace(/[\s-]+/g, "_");
-  if (VALID_FACULTY_DESIGNATIONS.includes(str)) return str;
-  if (str.includes("HOD")) return "HOD";
-  if (str.includes("ASSOCIATE")) return "ASSOCIATE_PROFESSOR";
-  if (str.includes("ASSISTANT")) return "ASSISTANT_PROFESSOR";
-  if (str.includes("PROFESSOR")) return "PROFESSOR";
-  return null;
-}
-
-/**
- * GET /api/admin/faculty
- * Retrieves faculty directory.
- * Supports ?all=true so timetable interfaces can list faculty from ANY department.
- * Also supports HOD department isolation and DEAN filtering.
- */
 export const getAdminFaculty = async (req, res) => {
   try {
-    const isAdmin = req.user?.role === "ADMIN" || req.user?.role === "SUPER_ADMIN";
-    // HOD dept resolved from JWT claim (DB-authoritative, set by authMiddleware)
-    const hodDepartmentId = req.user?.departmentId ?? null;
-    const isHod = Boolean(hodDepartmentId);
-
-    if (!isAdmin && !isHod) {
-      return res.status(403).json({
-        success: false,
-        message: "Forbidden: You do not have permission to access the faculty directory.",
-      });
-    }
-
-    // Support query parameter ?all=true for cross-department faculty access (e.g. timetable assignments)
-    const isAll =
-      req.query.all === "true" ||
-      req.query.all === true ||
-      String(req.query.all).toLowerCase() === "true";
-
-    let targetDepartment = null;
-    if (!isAll) {
-      if (hodDepartmentId) {
-        targetDepartment = hodDepartmentId;
-      } else {
-        const queryDept = (req.query.department || "").trim().toUpperCase();
-        if (queryDept && queryDept !== "ALL" && queryDept !== "DEAN" && queryDept !== "ALL DEPARTMENTS") {
-          targetDepartment = queryDept;
-        }
-      }
-    }
-
-    const isDeanFilter =
-      String(req.query.filter || req.query.department || "").trim().toUpperCase() === "DEAN" ||
-      String(req.query.isDean || "").toLowerCase() === "true";
-
-    const faculties = await db.orm.public.Faculty.all();
+    const faculty = await db.orm.public.Faculty.all();
     const users = await db.orm.public.User.all();
     const departments = await db.orm.public.Department.all();
 
-    let result = (faculties || []).map((f) => {
-      const u = users.find((user) => user.id === f.userId);
-      const d = departments.find((dept) => dept.id === f.departmentId);
-      const designation = f.designation || "ASSISTANT_PROFESSOR";
+    const result = faculty.map((member) => {
+      const user = users.find((item) => item.id === member.userId);
+      const department = departments.find(
+        (item) => item.id === member.departmentId,
+      );
 
       return {
-        id: f.id,
-        userId: f.userId,
-        name: u?.name || "Unknown",
-        email: u?.email || "",
-        employeeId: f.employeeId,
-        departmentId: f.departmentId,
-        department: d?.name || "Unknown",
-        departmentCode: d?.code || "Unknown",
-        designation,
-        isActive: u?.isActive !== false,
-        user: {
-          id: u?.id || f.userId,
-          name: u?.name || "Unknown",
-          email: u?.email || "",
-          isActive: u?.isActive !== false,
-        },
-        departmentDetails: {
-          id: d?.id || f.departmentId,
-          name: d?.name || "Unknown",
-          code: d?.code || "Unknown",
-        },
+        id: member.id,
+        userId: member.userId,
+        name: user?.name ?? "Unknown",
+        email: user?.email ?? null,
+        employeeId: member.employeeId,
+        department: department?.name ?? "Unknown",
+        departmentId: member.departmentId,
+        designation: member.designation ?? null,
+        isActive: user?.isActive ?? false,
       };
     });
-
-    // 1. Department Filter / HOD Isolation (bypassed if ?all=true)
-    if (targetDepartment) {
-      result = result.filter(
-        (f) =>
-          f.departmentCode.toUpperCase() === targetDepartment.toUpperCase() ||
-          f.department.toLowerCase().includes(targetDepartment.toLowerCase())
-      );
-    }
-
-    // 2. DEAN Filter (matches faculty whose designation contains "Dean", case-insensitive)
-    if (isDeanFilter) {
-      result = result.filter((f) =>
-        f.designation && String(f.designation).toLowerCase().includes("dean")
-      );
-    }
-
-    // 3. Search Filter: Faculty Name, Employee ID, Department, Designation
-    const searchTerm = (req.query.search || req.query.query || req.query.q || "")
-      .trim()
-      .toLowerCase();
-    if (searchTerm) {
-      result = result.filter(
-        (f) =>
-          f.name.toLowerCase().includes(searchTerm) ||
-          f.employeeId.toLowerCase().includes(searchTerm) ||
-          f.department.toLowerCase().includes(searchTerm) ||
-          f.departmentCode.toLowerCase().includes(searchTerm) ||
-          (f.designation && String(f.designation).toLowerCase().includes(searchTerm))
-      );
-    }
-
-    // Sort by name ASC
-    result.sort((a, b) => a.name.localeCompare(b.name));
 
     return res.status(200).json({
       success: true,
       data: result,
-      faculty: result,
-      total: result.length,
-      isHod: Boolean(hodDepartmentId),
-      department: targetDepartment,
-      crossDepartment: isAll,
     });
   } catch (error) {
-    console.error("Get admin faculty error:", error);
+    console.error("Admin faculty error:", error);
+
     return res.status(500).json({
       success: false,
-      message: "Failed to load faculty records",
+      message: "Failed to load faculty",
     });
   }
 };
 
-/**
- * POST /api/admin/faculty
- * Adds a new faculty member with Designation enum validation and transactional rollback.
- * Enforces HOD department isolation and validates unique employeeId & email.
- */
 export const createAdminFaculty = async (req, res) => {
   try {
-    const isAdmin = req.user?.role === "ADMIN" || req.user?.role === "SUPER_ADMIN";
-    // HOD dept resolved from JWT claim (DB-authoritative, set by authMiddleware)
-    const hodDepartmentId = req.user?.departmentId ?? null;
-    const isHod = Boolean(hodDepartmentId);
+    const { name, email, password, employeeId, departmentId, designation } =
+      req.body;
 
-    if (!isAdmin && !isHod) {
-      return res.status(403).json({
-        success: false,
-        message: "Forbidden: You do not have permission to add faculty.",
-      });
-    }
-
-    const { name, employeeId, department, departmentId, designation, email, password, role } = req.body;
-
-    // Role escalation guard: HOD cannot create SUPER_ADMIN or ADMIN accounts
-    if (hodDepartmentId && (role === "SUPER_ADMIN" || role === "ADMIN")) {
-      return res.status(403).json({
-        success: false,
-        message: "Forbidden: HOD cannot assign administrative roles.",
-      });
-    }
-
-    // Validation of required fields
-    if (!name || !employeeId) {
+    if (!name || !email || !password || !employeeId || !departmentId) {
       return res.status(400).json({
         success: false,
-        message: "Faculty Name and Employee ID are required",
+        message:
+          "Name, email, password, employee ID and department are required",
       });
     }
 
-    // Validate Designation against enum values
-    const finalDesignation = normalizeFacultyDesignation(designation);
-    if (!finalDesignation) {
-      return res.status(400).json({
-        success: false,
-        message: `Invalid designation. Allowed values: ${VALID_FACULTY_DESIGNATIONS.join(", ")}`,
-      });
-    }
-
-    const departments = await db.orm.public.Department.all();
-    let selectedDept = null;
-
-    if (hodDepartmentId) {
-
-      if (departmentId && Number(departmentId) !== Number(hodDepartmentId)) {
-        return res.status(403).json({
-          success: false,
-          message: "Forbidden: HOD cannot add faculty to another department.",
-        });
-      }
-
-      if (department) {
-        const bodyDept = resolveDepartment(departments, department);
-        if (bodyDept && bodyDept.id !== Number(hodDepartmentId)) {
-          return res.status(403).json({
-            success: false,
-            message: "Forbidden: HOD cannot add faculty to another department.",
-          });
-        }
-      }
-
-      // HOD can only add faculty to their authorized department
-      selectedDept = resolveDepartment(departments, hodDepartmentId);
-      if (!selectedDept) {
-        return res.status(403).json({
-          success: false,
-          message: `Authorized HOD department not found in database`,
-        });
-      }
-    } else if (departmentId) {
-      selectedDept = await ensureFacultyDepartment(departments, departmentId);
-    } else if (department) {
-      selectedDept = await ensureFacultyDepartment(departments, department);
-    }
-
-    if (!selectedDept) {
-      return res.status(400).json({
-        success: false,
-        message: "A valid Department is required",
-      });
-    }
-
+    const normalizedEmail = String(email).trim().toLowerCase();
     const normalizedEmployeeId = String(employeeId).trim().toUpperCase();
-    const normalizedEmail = email
-      ? String(email).trim().toLowerCase()
-      : `${normalizedEmployeeId.toLowerCase()}@klsvdit.edu.in`;
 
-    // Check duplicate employee ID
-    const existingFaculty = await db.orm.public.Faculty.all();
-    if (existingFaculty.some((f) => f.employeeId.toUpperCase() === normalizedEmployeeId)) {
+    const users = await db.orm.public.User.all();
+    const faculty = await db.orm.public.Faculty.all();
+    const departments = await db.orm.public.Department.all();
+
+    if (
+      users.some(
+        (user) => String(user.email).trim().toLowerCase() === normalizedEmail,
+      )
+    ) {
       return res.status(409).json({
         success: false,
-        message: `Employee ID "${normalizedEmployeeId}" already exists`,
+        message: "Email already exists",
       });
     }
 
-    // Check duplicate email
-    const existingUsers = await db.orm.public.User.all();
-    if (existingUsers.some((u) => u.email.toLowerCase() === normalizedEmail)) {
+    if (
+      faculty.some(
+        (member) =>
+          String(member.employeeId).trim().toUpperCase() ===
+          normalizedEmployeeId,
+      )
+    ) {
       return res.status(409).json({
         success: false,
-        message: `Email "${normalizedEmail}" already exists`,
+        message: "Employee ID already exists",
       });
     }
 
-    // Secure credential handling:
-    let rawPassword = password;
-    let temporaryPassword = null;
+    const selectedDepartment = departments.find(
+      (item) => item.id === Number(departmentId),
+    );
 
-    if (typeof rawPassword === "string" && rawPassword.trim().length >= 8) {
-      rawPassword = rawPassword.trim();
-    } else if (rawPassword && typeof rawPassword === "string" && rawPassword.trim().length > 0) {
-      return res.status(400).json({
+    if (!selectedDepartment) {
+      return res.status(404).json({
         success: false,
-        message: "Password must be at least 8 characters long",
+        message: "Department not found",
       });
-    } else {
-      temporaryPassword = generateSecureTemporaryCredential();
-      rawPassword = temporaryPassword;
     }
 
-    // Step 1: Hash password using bcrypt
-    const passwordHash = await bcrypt.hash(rawPassword, 10);
+    /*
+     * Faculty is intentionally NOT department restricted.
+     *
+     * A CSE Admin can create an ECE faculty member,
+     * because faculty may teach classes belonging to
+     * another department.
+     */
 
-    // Step 2: Create User with role = FACULTY
+    const passwordHash = await bcrypt.hash(String(password), 10);
+
     const user = await db.orm.public.User.create({
       name: String(name).trim(),
       email: normalizedEmail,
       passwordHash,
       role: "FACULTY",
+      departmentId: selectedDepartment.id,
       isActive: true,
     });
 
-    // Step 3: Create Faculty linked to User.id and departmentId with transactional rollback protection
-    let faculty;
-    try {
-      faculty = await db.orm.public.Faculty.create({
-        userId: user.id,
-        employeeId: normalizedEmployeeId,
-        departmentId: selectedDept.id,
-        designation: finalDesignation,
-      });
-    } catch (facultyError) {
-      // Compensating rollback: remove User if Faculty creation fails
-      console.error("Failed to create faculty record, rolling back user creation:", facultyError);
-      await db.orm.public.User.where({ id: user.id }).delete().catch((err) => {
-        console.error("Rollback failed to delete user:", err);
-      });
-      throw facultyError;
-    }
-
-    const facultyData = {
-      id: faculty.id,
+    const facultyRecord = await db.orm.public.Faculty.create({
       userId: user.id,
-      name: user.name,
-      email: user.email,
-      employeeId: faculty.employeeId,
-      department: selectedDept.name,
-      departmentCode: selectedDept.code,
-      departmentId: selectedDept.id,
-      designation: faculty.designation,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        isActive: user.isActive,
-      },
-      departmentDetails: {
-        id: selectedDept.id,
-        name: selectedDept.name,
-        code: selectedDept.code,
-      },
-      ...(temporaryPassword ? { temporaryPassword } : {}),
-    };
+      employeeId: normalizedEmployeeId,
+      departmentId: selectedDepartment.id,
+      ...(designation ? { designation: String(designation).trim() } : {}),
+    });
 
     return res.status(201).json({
       success: true,
-      message: "Faculty member added successfully",
-      data: facultyData,
-      faculty: facultyData,
+      message: "Faculty created successfully",
+      data: {
+        id: facultyRecord.id,
+        userId: user.id,
+        name: user.name,
+        email: user.email,
+        employeeId: facultyRecord.employeeId,
+        department: selectedDepartment.name,
+        departmentId: selectedDepartment.id,
+        designation: facultyRecord.designation ?? null,
+      },
     });
   } catch (error) {
-    console.error("Create admin faculty error:", error);
+    console.error("Admin create faculty error:", error);
+
     return res.status(500).json({
       success: false,
-      message: "Failed to add faculty member",
+      message: "Failed to create faculty",
     });
   }
 };
 
-/**
- * PUT /api/admin/faculty/:id & PATCH /api/admin/faculty/:id
- * Updates an existing faculty member's Name, Email, Employee ID, Department, Designation.
- * Enforces HOD department isolation and email/employeeId uniqueness.
- */
 export const updateAdminFaculty = async (req, res) => {
   try {
-    const facultyId = parseInt(req.params.id, 10);
-    if (isNaN(facultyId)) {
-      return res.status(400).json({ success: false, message: "Invalid faculty ID" });
-    }
+    const facultyId = Number(req.params.id);
 
-    const isAdmin = req.user?.role === "ADMIN" || req.user?.role === "SUPER_ADMIN";
-    // HOD dept resolved from JWT claim (DB-authoritative, set by authMiddleware)
-    const hodDepartmentId = req.user?.departmentId ?? null;
-    const isHod = Boolean(hodDepartmentId);
-
-    if (!isAdmin && !isHod) {
-      return res.status(403).json({
+    if (!Number.isInteger(facultyId)) {
+      return res.status(400).json({
         success: false,
-        message: "Forbidden: You do not have permission to update faculty.",
+        message: "Invalid faculty ID",
       });
     }
 
-    const faculties = await db.orm.public.Faculty.where({ id: facultyId }).all();
-    if (!faculties || faculties.length === 0) {
-      return res.status(404).json({ success: false, message: "Faculty member not found" });
-    }
-    const faculty = faculties[0];
+    const { name, employeeId, departmentId, designation } = req.body;
 
-    const departments = await db.orm.public.Department.all();
-    const currentDept = departments.find((d) => d.id === faculty.departmentId);
+    const [facultyList, users, departments] = await Promise.all([
+      db.orm.public.Faculty.all(),
+      db.orm.public.User.all(),
+      db.orm.public.Department.all(),
+    ]);
 
-    // HOD ISOLATION: verify target faculty belongs to HOD's department
-    if (isHod && (!currentDept || !isDepartmentMatch(currentDept, hodDepartmentId))) {
-      return res.status(403).json({
+    const faculty = facultyList.find((item) => item.id === facultyId);
+
+    if (!faculty) {
+      return res.status(404).json({
         success: false,
-        message: "Forbidden: You cannot update faculty outside your authorized department.",
+        message: "Faculty not found",
       });
     }
 
-    const { name, email, employeeId, department, departmentId, designation } = req.body;
+    const user = users.find((item) => item.id === faculty.userId);
 
-    // HOD ISOLATION: An HOD MUST NOT be able to move faculty to another department.
-    if (isHod && (department !== undefined || departmentId !== undefined)) {
-      const targetDept = resolveDepartment(departments, departmentId || department);
-
-      if (targetDept) {
-        if (!isDepartmentMatch(targetDept, hodDepartmentId)) {
-          return res.status(403).json({
-            success: false,
-            message: "Forbidden: HODs cannot move faculty to another department.",
-          });
-        }
-      } else {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid or nonexistent department specified.",
-        });
-      }
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "Faculty user account not found",
+      });
     }
 
-    // 1. Update Name on User
-    let updatedName = undefined;
-    if (name && String(name).trim().length > 0) {
-      updatedName = String(name).trim();
-      await db.orm.public.User.where({ id: faculty.userId }).update({ name: updatedName });
+    const allowedDesignations = [
+      "HOD",
+      "PROFESSOR",
+      "ASSOCIATE_PROFESSOR",
+      "ASSISTANT_PROFESSOR",
+    ];
+
+    if (
+      designation !== undefined &&
+      !allowedDesignations.includes(designation)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid faculty designation",
+      });
     }
 
-    // 2. Update Email on User with duplicate collision check
-    let updatedEmail = undefined;
-    if (email !== undefined && String(email).trim().length > 0) {
-      const normalizedEmail = String(email).trim().toLowerCase();
-      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(normalizedEmail)) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid email address format.",
-        });
-      }
+    if (employeeId !== undefined) {
+      const normalizedEmployeeId = String(employeeId).trim();
 
-      const allUsers = await db.orm.public.User.all();
-      const duplicateUser = allUsers.find(
-        (u) => u.id !== faculty.userId && u.email.toLowerCase() === normalizedEmail
-      );
-      if (duplicateUser) {
-        return res.status(409).json({
-          success: false,
-          message: `Email "${normalizedEmail}" is already in use by another account.`,
-        });
-      }
-
-      updatedEmail = normalizedEmail;
-      await db.orm.public.User.where({ id: faculty.userId }).update({ email: updatedEmail });
-    }
-
-    // 3. Check and update Employee ID
-    const facultyUpdates = {};
-    if (employeeId && String(employeeId).trim().toUpperCase() !== faculty.employeeId) {
-      const normalizedEmployeeId = String(employeeId).trim().toUpperCase();
-      const allFaculty = await db.orm.public.Faculty.all();
-      if (allFaculty.some((f) => f.id !== faculty.id && f.employeeId.toUpperCase() === normalizedEmployeeId)) {
-        return res.status(409).json({
-          success: false,
-          message: `Employee ID "${normalizedEmployeeId}" is already assigned to another faculty member.`,
-        });
-      }
-      facultyUpdates.employeeId = normalizedEmployeeId;
-    }
-
-    // 4. Update Designation with enum validation
-    if (designation !== undefined) {
-      const finalDesignation = normalizeFacultyDesignation(designation);
-      if (!finalDesignation) {
-        return res.status(400).json({
-          success: false,
-          message: `Invalid designation. Allowed values: ${VALID_FACULTY_DESIGNATIONS.join(", ")}`,
-        });
-      }
-      facultyUpdates.designation = finalDesignation;
-    }
-
-    // 5. Update Department (Admin can change faculty department to any valid department in PostgreSQL)
-    if (isAdmin && (department !== undefined || departmentId !== undefined)) {
-      const deptQuery = String(department || "").trim();
-      const deptIdQuery =
-        departmentId !== undefined && departmentId !== null && String(departmentId).trim() !== ""
-          ? Number(departmentId)
-          : null;
-
-      const newDept = departments.find(
-        (d) =>
-          (deptIdQuery !== null && !isNaN(deptIdQuery) && d.id === deptIdQuery) ||
-          (deptQuery &&
-            (d.code?.toUpperCase() === deptQuery.toUpperCase() ||
-              d.name?.toLowerCase() === deptQuery.toLowerCase()))
+      const duplicate = facultyList.find(
+        (item) =>
+          item.id !== facultyId && item.employeeId === normalizedEmployeeId,
       );
 
-      if (!newDept) {
-        return res.status(400).json({
+      if (duplicate) {
+        return res.status(409).json({
           success: false,
-          message: "Invalid or nonexistent department specified.",
+          message: "Employee ID already exists",
         });
       }
-
-      facultyUpdates.departmentId = newDept.id;
     }
 
-    if (Object.keys(facultyUpdates).length > 0) {
-      await db.orm.public.Faculty.where({ id: faculty.id }).update(facultyUpdates);
+    let selectedDepartment = null;
+
+    if (departmentId !== undefined) {
+      selectedDepartment = departments.find(
+        (department) => department.id === Number(departmentId),
+      );
+
+      if (!selectedDepartment) {
+        return res.status(404).json({
+          success: false,
+          message: "Department not found",
+        });
+      }
+    } else {
+      selectedDepartment = departments.find(
+        (department) => department.id === faculty.departmentId,
+      );
     }
 
-    // Return updated profile
-    const users = await db.orm.public.User.where({ id: faculty.userId }).all();
-    const updatedUser = users[0];
-    const updatedDept = departments.find(
-      (d) => d.id === (facultyUpdates.departmentId || faculty.departmentId)
-    );
+    const updatedUser = await db.orm.public.User.where({ id: user.id }).update({
+      ...(name !== undefined && {
+        name: String(name).trim(),
+      }),
+    });
 
-    const updatedFacultyData = {
-      id: faculty.id,
-      userId: faculty.userId,
-      name: updatedName || updatedUser?.name || "Faculty",
-      email: updatedEmail || updatedUser?.email || "",
-      employeeId: facultyUpdates.employeeId || faculty.employeeId,
-      department: updatedDept?.name || currentDept?.name,
-      departmentCode: updatedDept?.code || currentDept?.code,
-      departmentId: updatedDept?.id || faculty.departmentId,
-      designation:
-        facultyUpdates.designation !== undefined ? facultyUpdates.designation : faculty.designation,
-      isActive: updatedUser?.isActive !== false,
-      user: {
-        id: updatedUser?.id || faculty.userId,
-        name: updatedName || updatedUser?.name || "Faculty",
-        email: updatedEmail || updatedUser?.email || "",
-        isActive: updatedUser?.isActive !== false,
-      },
-      departmentDetails: {
-        id: updatedDept?.id || faculty.departmentId,
-        name: updatedDept?.name || currentDept?.name,
-        code: updatedDept?.code || currentDept?.code,
-      },
-    };
+    const updatedFaculty = await db.orm.public.Faculty.where({
+      id: facultyId,
+    }).update({
+      ...(employeeId !== undefined && {
+        employeeId: String(employeeId).trim(),
+      }),
+      ...(departmentId !== undefined && {
+        departmentId: Number(departmentId),
+      }),
+      ...(designation !== undefined && {
+        designation,
+      }),
+    });
 
     return res.status(200).json({
       success: true,
-      message: "Faculty member updated successfully",
-      data: updatedFacultyData,
-      faculty: updatedFacultyData,
+      message: "Faculty updated successfully",
+      data: {
+        id: updatedFaculty.id,
+        userId: updatedUser.id,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        employeeId: updatedFaculty.employeeId,
+        designation: updatedFaculty.designation,
+        departmentId: updatedFaculty.departmentId,
+        department: selectedDepartment?.name ?? "",
+        departmentCode: selectedDepartment?.code ?? "",
+      },
     });
   } catch (error) {
     console.error("Update admin faculty error:", error);
+
     return res.status(500).json({
       success: false,
-      message: "Failed to update faculty member",
+      message: "Failed to update faculty",
     });
   }
 };
 
-/**
- * DELETE /api/admin/faculty/:id
- * Safely deletes or deactivates (soft deletes) a faculty member.
- * Validates that existing Class links do not cause database key violations (onDelete safety checks).
- */
 export const deleteAdminFaculty = async (req, res) => {
   try {
-    const facultyId = parseInt(req.params.id, 10);
-    if (isNaN(facultyId)) {
-      return res.status(400).json({ success: false, message: "Invalid faculty ID" });
-    }
+    const facultyId = Number(req.params.id);
 
-    const isAdmin = req.user?.role === "ADMIN" || req.user?.role === "SUPER_ADMIN";
-    // HOD dept resolved from JWT claim (DB-authoritative, set by authMiddleware)
-    const hodDepartmentId = req.user?.departmentId ?? null;
-    const isHod = Boolean(hodDepartmentId);
-
-    if (!isAdmin && !isHod) {
-      return res.status(403).json({
-        success: false,
-        message: "Forbidden: You do not have permission to delete faculty.",
-      });
-    }
-
-    const faculties = await db.orm.public.Faculty.where({ id: facultyId }).all();
-    if (!faculties || faculties.length === 0) {
-      return res.status(404).json({ success: false, message: "Faculty member not found" });
-    }
-    const faculty = faculties[0];
-
-    const departments = await db.orm.public.Department.all();
-    const currentDept = departments.find((d) => d.id === faculty.departmentId);
-
-    // HOD ISOLATION: verify target faculty belongs to HOD's department
-    if (isHod && (!currentDept || !isDepartmentMatch(currentDept, hodDepartmentId))) {
-      return res.status(403).json({
-        success: false,
-        message: "Forbidden: You cannot delete faculty outside your authorized department.",
-      });
-    }
-
-    // Class relation guard: Check if faculty is actively assigned to classes
-    const classes = await db.orm.public.Class.where({ facultyId: faculty.id }).all();
-    if (classes && classes.length > 0) {
+    if (!Number.isInteger(facultyId)) {
       return res.status(400).json({
         success: false,
-        message: `Cannot delete faculty member assigned to ${classes.length} active academic class(es). Reassign or remove class assignments first to prevent foreign key violations.`,
+        message: "Invalid faculty ID",
       });
     }
 
-    // Support soft-delete (?soft=true, ?deactivate=true, or body { soft: true, action: "deactivate" })
-    const isSoftDelete =
-      req.query.soft === "true" ||
-      req.query.deactivate === "true" ||
-      req.body?.soft === true ||
-      req.body?.action === "deactivate";
+    const facultyList = await db.orm.public.Faculty.all();
 
-    if (isSoftDelete) {
-      if (faculty.userId) {
-        await db.orm.public.User.where({ id: faculty.userId }).update({ isActive: false });
-      }
-      return res.status(200).json({
-        success: true,
-        message: "Faculty user account deactivated successfully (soft deleted).",
-        data: {
-          id: faculty.id,
-          employeeId: faculty.employeeId,
-          isActive: false,
-        },
+    const faculty = facultyList.find((item) => item.id === facultyId);
+
+    if (!faculty) {
+      return res.status(404).json({
+        success: false,
+        message: "Faculty not found",
       });
     }
 
-    // Clean up notifications for faculty user
-    if (faculty.userId) {
-      const notifs = await db.orm.public.Notification.where({ userId: faculty.userId }).all();
-      if (notifs && notifs.length > 0) {
-        await db.orm.public.Notification.where({ userId: faculty.userId }).delete();
-      }
+    // Do not allow deletion if this faculty is assigned to a class.
+    const classes = await db.orm.public.Class.all();
+
+    const assignedClass = classes.find((item) => item.facultyId === facultyId);
+
+    if (assignedClass) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Faculty cannot be deleted because they are assigned to a class",
+      });
     }
 
-    // Delete Faculty record
-    await db.orm.public.Faculty.where({ id: faculty.id }).delete();
+    await db.orm.public.Faculty.where({ id: facultyId }).delete();
 
-    // Delete or deactivate associated User record
-    if (faculty.userId) {
-      const users = await db.orm.public.User.where({ id: faculty.userId }).all();
-      const user = users[0];
-      if (user && user.role === "FACULTY") {
-        try {
-          await db.orm.public.User.where({ id: user.id }).delete();
-        } catch (uErr) {
-          // If User deletion has other FK dependencies, safely set isActive: false
-          await db.orm.public.User.where({ id: user.id }).update({ isActive: false });
-        }
-      }
-    }
+    await db.orm.public.User.where({ id: faculty.userId }).delete();
 
     return res.status(200).json({
       success: true,
-      message: "Faculty member deleted successfully.",
-      data: {
-        id: faculty.id,
-        employeeId: faculty.employeeId,
-      },
+      message: "Faculty deleted successfully",
     });
   } catch (error) {
     console.error("Delete admin faculty error:", error);
+
     return res.status(500).json({
       success: false,
-      message: "Failed to delete faculty member",
+      message: "Failed to delete faculty",
     });
   }
 };
+
 
 /**
  * GET /api/admin/faculty/export
@@ -2656,5 +2598,3 @@ export const exportAdminStudents = async (req, res) => {
     });
   }
 };
-
-
