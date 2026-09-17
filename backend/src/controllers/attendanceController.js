@@ -111,27 +111,12 @@ export const createAttendanceSession = async (req, res) => {
     console.log("🔥 INDIA DATE:", `${indiaYear}-${indiaMonth}-${indiaDay}`);
     console.log("🔥 INDIA WEEKDAY:", weekday);
     console.log("🔥 INDIA DAY NUMBER:", todayDay);
-
-    console.log("🔥 SERVER NOW:", now.toISOString());
-    console.log("🔥 SERVER LOCAL:", now.toString());
-    console.log("🔥 SERVER DAY:", now.getDay());
-    console.log("🔥 CALCULATED TODAY DAY:", todayDay);
     console.log("🔥 REQUESTED CLASS ID:", classId);
-
-    console.log(
-      "🔥 TEST CLASS:",
-      timetables.filter((item) => Number(item.classId) === Number(classId)),
-    );
 
     const todayTimetable = timetables.find(
       (item) =>
         Number(item.classId) === Number(classId) &&
         Number(item.dayOfWeek) === todayDay,
-    );
-
-    console.log(
-      "🔥 CLASS TIMETABLES:",
-      timetables.filter((item) => Number(item.classId) === Number(classId)),
     );
 
     console.log("🔥 STUDENT MATCHED TIMETABLE:", todayTimetable);
@@ -142,6 +127,7 @@ export const createAttendanceSession = async (req, res) => {
         message: "This class is not scheduled for today",
       });
     }
+
     // --------------------------------------------------
     // 4. Convert timetable start/end into today's dates
     // --------------------------------------------------
@@ -171,29 +157,24 @@ export const createAttendanceSession = async (req, res) => {
       });
     }
 
-    // // --------------------------------------------------
-    // // 6. Too late
-    // // --------------------------------------------------
-
-    // if (now >= scheduleEnd) {
-    //   return res.status(400).json({
-    //     success: false,
-    //     message: `Attendance session for this class ended at ${todayTimetable.endTime}`,
-    //   });
-    // }
-
     // --------------------------------------------------
-    // 7. Check whether a session already exists
+    // 6. Get all sessions for this class
     // --------------------------------------------------
 
     const sessions = await db.orm.public.AttendanceSession.all();
 
-    const activeSession = sessions.find(
+    const classSessions = sessions.filter(
       (session) =>
-        session.classId === Number(classId) &&
-        !session.endedAt &&
-        session.startedAt &&
-        new Date(session.startedAt) >= scheduleStart,
+        Number(session.classId) === Number(classId) && session.startedAt,
+    );
+
+    // --------------------------------------------------
+    // 7. Check for an ACTIVE session for today's timetable
+    // --------------------------------------------------
+
+    const activeSession = classSessions.find(
+      (session) =>
+        !session.endedAt && new Date(session.startedAt) >= scheduleStart,
     );
 
     if (activeSession) {
@@ -205,7 +186,26 @@ export const createAttendanceSession = async (req, res) => {
     }
 
     // --------------------------------------------------
-    // 8. Create attendance session
+    // 8. Check whether today's session was already finalized
+    // --------------------------------------------------
+
+    const finalizedSession = classSessions.find((session) => {
+      const startedAt = new Date(session.startedAt);
+
+      return session.endedAt && startedAt >= scheduleStart && startedAt <= now;
+    });
+
+    if (finalizedSession) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Attendance for this class has already been finalized for today. You can manually edit attendance from the attendance record.",
+        data: finalizedSession,
+      });
+    }
+
+    // --------------------------------------------------
+    // 9. Create new attendance session
     // --------------------------------------------------
 
     const session = await db.orm.public.AttendanceSession.create({
@@ -215,7 +215,7 @@ export const createAttendanceSession = async (req, res) => {
     });
 
     // --------------------------------------------------
-    // 9. Return session + schedule information
+    // 10. Return session + schedule information
     // --------------------------------------------------
 
     return res.status(201).json({
@@ -595,7 +595,10 @@ export const updateAttendance = async (req, res) => {
       });
     }
 
-    // Find faculty
+    // --------------------------------------------------
+    // 1. Find faculty
+    // --------------------------------------------------
+
     const facultyList = await db.orm.public.Faculty.all();
 
     const faculty = facultyList.find((item) => item.userId === userId);
@@ -607,7 +610,10 @@ export const updateAttendance = async (req, res) => {
       });
     }
 
-    // Find attendance
+    // --------------------------------------------------
+    // 2. Find attendance record
+    // --------------------------------------------------
+
     const attendanceRecords = await db.orm.public.Attendance.all();
 
     const attendance = attendanceRecords.find(
@@ -621,7 +627,10 @@ export const updateAttendance = async (req, res) => {
       });
     }
 
-    // Find session
+    // --------------------------------------------------
+    // 3. Find session
+    // --------------------------------------------------
+
     const sessions = await db.orm.public.AttendanceSession.all();
 
     const session = sessions.find((item) => item.id === attendance.sessionId);
@@ -633,14 +642,16 @@ export const updateAttendance = async (req, res) => {
       });
     }
 
-    if (session.endedAt) {
-      return res.status(400).json({
-        success: false,
-        message: "Attendance session is already finalized",
-      });
-    }
+    // --------------------------------------------------
+    // IMPORTANT:
+    // Finalized sessions CAN still be manually edited.
+    // We intentionally do NOT block session.endedAt here.
+    // --------------------------------------------------
 
-    // Verify faculty owns the class
+    // --------------------------------------------------
+    // 4. Verify faculty owns the class
+    // --------------------------------------------------
+
     const classes = await db.orm.public.Class.all();
 
     const classItem = classes.find(
@@ -654,12 +665,20 @@ export const updateAttendance = async (req, res) => {
       });
     }
 
+    // --------------------------------------------------
+    // 5. Check whether status actually changed
+    // --------------------------------------------------
+
     if (attendance.status === status) {
       return res.status(400).json({
         success: false,
         message: "New status is same as current status",
       });
     }
+
+    // --------------------------------------------------
+    // 6. Update attendance manually
+    // --------------------------------------------------
 
     const updatedAttendance = await db.orm.public.Attendance.where({
       id: attendanceId,
@@ -669,6 +688,10 @@ export const updateAttendance = async (req, res) => {
       modifiedBy: faculty.userId,
     });
 
+    // --------------------------------------------------
+    // 7. Create audit log
+    // --------------------------------------------------
+
     const log = await db.orm.public.AttendanceLog.create({
       attendanceId,
       oldStatus: attendance.status,
@@ -677,22 +700,20 @@ export const updateAttendance = async (req, res) => {
       reason: reason || null,
     });
 
+    // --------------------------------------------------
+    // 8. Return result
+    // --------------------------------------------------
+
     res.status(200).json({
       success: true,
-      message: "Attendance updated successfully",
+      message: session.endedAt
+        ? "Attendance manually updated after finalization"
+        : "Attendance updated successfully",
       data: {
         attendance: updatedAttendance,
         log,
       },
     });
-    // } catch (error) {
-    //   console.error("Error updating attendance:", error);
-
-    //   res.status(500).json({
-    //     success: false,
-    //     message: "Failed to update attendance",
-    //   });
-    // }
   } catch (error) {
     console.error("Error updating attendance:", error);
 
